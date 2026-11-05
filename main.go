@@ -16,9 +16,8 @@ const filenameFormat = "2006-01-02.xj"
 
 func main() {
 	cmd := &cli.Command{
-		Name:   "xj",
-		Usage:  "A simple tool for version-controllable work journals",
-		Action: func(context.Context, *cli.Command) error { return nil },
+		Name:     "xj",
+		Usage:    "A simple tool for version-controllable work journals",
 		Commands: []*cli.Command{
 			{
 				Name:   "new",

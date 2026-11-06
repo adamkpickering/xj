@@ -37,6 +37,12 @@ func main() {
 						Name:   "sync",
 						Usage:  "Construct vector database",
 						Action: ragSync,
+						Arguments: []cli.Argument{
+							&cli.StringArg{
+								Name:     "path",
+								Required: true,
+							},
+						},
 					},
 					{
 						Name:   "query",
@@ -144,7 +150,7 @@ func load(dbPath string) (*chromem.DB, *chromem.Collection, error) {
 		return nil, nil, fmt.Errorf("failed to stat database file: %w", err)
 	}
 
-	embeddingFunc := chromem.NewEmbeddingFuncOllama("nomic-embed-text", "http://127.0.0.1:11434/api")
+	embeddingFunc := chromem.NewEmbeddingFuncOllama("embeddinggemma-2:270m", "http://127.0.0.1:11434/api")
 	collection, err := db.GetOrCreateCollection("work-journal", nil, embeddingFunc)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get or create collection: %w", err)
@@ -154,21 +160,33 @@ func load(dbPath string) (*chromem.DB, *chromem.Collection, error) {
 }
 
 func ragSync(ctx context.Context, cmd *cli.Command) error {
-	dbPath := "chromem-go"
+	rawContentDir := cmd.StringArg("path")
+	contentDir, err := filepath.Abs(rawContentDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve %q: %w", rawContentDir, err)
+	}
+	dbFilename := "chromem-go"
 
-	db, collection, err := load(dbPath)
+	db, collection, err := load(dbFilename)
 	if err != nil {
 		return fmt.Errorf("failed to load collection: %w", err)
 	}
 
-	entries, err := filepath.Glob("/home/adam/projects/work-journal/default/*.xj")
+	entries, err := os.ReadDir(contentDir)
 	if err != nil {
-		return fmt.Errorf("failed to list .xj files: %w", err)
+		return fmt.Errorf("failed to read dir: %w", err)
+	}
+	fileEntries := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			fullPath := filepath.Join(contentDir, entry.Name())
+			fileEntries = append(fileEntries, fullPath)
+		}
 	}
 
 	// Come up with list of desiredDocuments we'd like to have in the DB
 	IDToDesiredDocument := map[string]chromem.Document{}
-	for _, entry := range entries {
+	for _, entry := range fileEntries {
 		// Assume there are no subdirectories
 		filename := filepath.Base(entry)
 		content, err := os.ReadFile(entry)
@@ -219,7 +237,7 @@ func ragSync(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
-	if err := db.ExportToFile(dbPath, false, ""); err != nil {
+	if err := db.ExportToFile(dbFilename, false, ""); err != nil {
 		return fmt.Errorf("failed to export db: %w", err)
 	}
 

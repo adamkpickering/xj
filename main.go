@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 )
 
 const filenameFormat = "2006-01-02.xj"
+const filenameFieldName = "name"
 
 func main() {
 	cmd := &cli.Command{
@@ -38,6 +42,12 @@ func main() {
 						Name:   "query",
 						Usage:  "Run vector search",
 						Action: ragQuery,
+						Arguments: []cli.Argument{
+							&cli.StringArg{
+								Name:     "query",
+								Required: true,
+							},
+						},
 					},
 				},
 			},
@@ -118,10 +128,20 @@ func chunkText(text string, maxChars int) []string {
 	return chunks
 }
 
+func hashContent(content string) string {
+	h := fnv.New64a()
+	h.Write([]byte(content))
+	return strconv.FormatUint(h.Sum64(), 36)
+}
+
 func load(dbPath string) (*chromem.DB, *chromem.Collection, error) {
 	db := chromem.NewDB()
-	if err := db.ImportFromFile(dbPath, ""); err != nil {
-		return nil, nil, fmt.Errorf("failed to import database: %w", err)
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := db.ImportFromFile(dbPath, ""); err != nil {
+			return nil, nil, fmt.Errorf("failed to import database: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("failed to stat database file: %w", err)
 	}
 
 	embeddingFunc := chromem.NewEmbeddingFuncOllama("nomic-embed-text", "http://127.0.0.1:11434/api")
@@ -146,24 +166,56 @@ func ragSync(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("failed to list .xj files: %w", err)
 	}
 
-	for i, entry := range entries {
+	// Come up with list of desiredDocuments we'd like to have in the DB
+	IDToDesiredDocument := map[string]chromem.Document{}
+	for _, entry := range entries {
+		// Assume there are no subdirectories
+		filename := filepath.Base(entry)
 		content, err := os.ReadFile(entry)
 		if err != nil {
-			return fmt.Errorf("failed to read %q: %w", entry, err)
+			return fmt.Errorf("failed to read %q: %w", filename, err)
 		}
-		chunks := chunkText(string(content), 256)
-		for j, chunk := range chunks {
-			fmt.Printf("Adding document for chunk %d of %s\n", j, entry)
+		chunks := chunkText(string(content), 4000)
+		for _, chunk := range chunks {
 			document := chromem.Document{
-				ID:      fmt.Sprintf("%d-%d", i, j),
+				ID:      hashContent(chunk),
 				Content: chunk,
 				Metadata: map[string]string{
-					"path": entry,
+					filenameFieldName: filename,
 				},
 			}
-			if err := collection.AddDocument(ctx, document); err != nil {
-				return fmt.Errorf("failed to add document for chunk %d of %s: %w", j, entry, err)
-			}
+			IDToDesiredDocument[document.ID] = document
+		}
+	}
+
+	// Remove existing documents that are not in desired documents
+	existingDocuments, err := collection.ListDocuments(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list existing documents: %w", err)
+	}
+	for _, existingDocument := range existingDocuments {
+		if _, ok := IDToDesiredDocument[existingDocument.ID]; ok {
+			continue
+		}
+		fmt.Printf("Removing %s from %s\n", existingDocument.ID, existingDocument.Metadata[filenameFieldName])
+		if err := collection.Delete(ctx, nil, nil, existingDocument.ID); err != nil {
+			return fmt.Errorf("failed to delete existing document with id %s: %w", existingDocument.ID, err)
+		}
+	}
+
+	// Add/update desired documents that are not in existing documents
+	IDToExistingDocument := map[string]chromem.Document{}
+	for _, existingDocument := range existingDocuments {
+		IDToExistingDocument[existingDocument.ID] = *existingDocument
+	}
+	for id, desiredDocument := range IDToDesiredDocument {
+		if _, ok := IDToExistingDocument[id]; ok {
+			fmt.Printf("Found existing %s from %s; skipping\n", desiredDocument.ID, desiredDocument.Metadata[filenameFieldName])
+			continue
+		}
+		fmt.Printf("Adding %s from %s\n", desiredDocument.ID, desiredDocument.Metadata[filenameFieldName])
+		if err := collection.AddDocument(ctx, desiredDocument); err != nil {
+			return fmt.Errorf("failed to add chunk %s from %s: %w", desiredDocument.ID, desiredDocument.Metadata[filenameFieldName], err)
 		}
 	}
 
@@ -175,18 +227,20 @@ func ragSync(ctx context.Context, cmd *cli.Command) error {
 }
 
 func ragQuery(ctx context.Context, cmd *cli.Command) error {
+	query := cmd.StringArg("query")
+
 	_, collection, err := load("chromem-go")
 	if err != nil {
 		return fmt.Errorf("failed to load collection: %w", err)
 	}
 
-	results, err := collection.Query(ctx, "Find instances of swearing.", 2, nil, nil)
+	results, err := collection.Query(ctx, query, 5, nil, nil)
 	if err != nil {
 		return fmt.Errorf("query failed: %w", err)
 	}
 
 	for _, result := range results {
-		fmt.Printf("%s\n\n", result.Content)
+		fmt.Printf("%s:%s\n", result.Metadata[filenameFieldName], result.ID)
 	}
 
 	return nil
